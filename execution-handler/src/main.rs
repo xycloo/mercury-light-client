@@ -4,20 +4,6 @@ use deadpool_postgres::{Config as PgConfig, Pool};
 use tokio_postgres::NoTls;
 use sha2::{Sha256, Digest};
 
-#[derive(Deserialize)]
-struct UploadRequest {
-    user_id: i64,
-    #[serde(with = "serde_bytes")]     // so bytes come through JSON as base64 automatically
-    code: Vec<u8>,
-    is_contract: bool,
-    contracts: Option<Vec<String>>,
-}
-
-#[derive(Deserialize)]
-struct ExecuteRequest {
-    mode: String,     // e.g. "catchup" or "function"
-    // ... any extra params ...
-}
 
 #[derive(Deserialize, Serialize, Debug)]
 struct CodeUploadClient {
@@ -30,7 +16,7 @@ fn with_db(pool: Pool) -> impl Filter<Extract = (Pool,), Error = std::convert::I
     warp::any().map(move || pool.clone())
 }
 
-pub async fn insert_zephyr_code<'a>(
+async fn insert_zephyr_code<'a>(
     code: &Vec<u8>,
     is_contract: bool,
     contracts: Vec<String>,
@@ -115,7 +101,7 @@ async fn upload(
     let engine = Engine::new(&config);
     Module::validate(&engine, &code).map_err(|_| Error::InvalidWASMCode)?;
 
-    database::insert_zephyr_code(
+    insert_zephyr_code(
         code,
         is_contract,
         contracts,
@@ -179,7 +165,10 @@ async fn main() {
         .and(warp::path("execute"))
         */
         
-        let routes = upload.with(warp::log("zephyr_uploader"));
+        let routes = warp::post()
+        .and(upload_zephyr_code)
+        .with(warp::log("zephyr_uploader"));
+
 
         /*
     let routes = upload.or(execute)
