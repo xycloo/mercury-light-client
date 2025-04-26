@@ -1,179 +1,112 @@
-use warp::Filter;
-use serde::{Deserialize, Serialize};
-use deadpool_postgres::{Config as PgConfig, Pool};
-use tokio_postgres::NoTls;
-use sha2::{Sha256, Digest};
+use std::sync::Arc;
 
+use database::{ActorStatus, DbInstruction, DbInstructionWithCallback, PgConnectionActor};
+use serverless::{Config, InvokeZephyrFunction};
+use tokio::sync::{mpsc, oneshot};
+use warp::{reject::Rejection, reply::WithStatus, Filter, http::StatusCode};
+use serde::{Deserialize, Serialize};
+
+mod macros;
+mod database;
+mod serverless;
 
 #[derive(Deserialize, Serialize, Debug)]
 struct CodeUploadClient {
-    code: Option<Vec<u8>>,
+    code: Vec<u8>,
     contract: Option<bool>,
     contracts: Option<Vec<String>>,
 }
 
-fn with_db(pool: Pool) -> impl Filter<Extract = (Pool,), Error = std::convert::Infallible> + Clone {
-    warp::any().map(move || pool.clone())
+fn with_ctx<T: Send+Sync+Clone>(
+    ctx: Arc<T>,
+) -> impl Filter<Extract = (Arc<T>,), Error = std::convert::Infallible> + Clone
+{
+    warp::any().map(move || ctx.clone())
 }
 
-async fn insert_zephyr_code<'a>(
-    code: &Vec<u8>,
-    is_contract: bool,
-    contracts: Vec<String>,
-) -> Result<(), Error> {
-    let postgres_args: String = env::var("INGESTOR_DB").unwrap();
-
-    let (client, connection) = tokio_postgres::connect(&postgres_args, NoTls)
-        .await
-        .unwrap();
-
-    tokio::spawn(async move {
-        if let Err(e) = connection.await {
-            eprintln!("connection error: {}", e);
-        }
-    });
-
-    /*
-    let delete_stmt = client
-        .prepare_typed(
-            "DELETE FROM public.zephyr_programs WHERE user_id = $1 AND project_name = $2",
-            &[
-                tokio_postgres::types::Type::INT4,
-                tokio_postgres::types::Type::TEXT,
-            ],
-        )
-        .await
-        .unwrap();
-
-    client
-        .execute(&delete_stmt, &[&user, &project_name])
-        .await
-        .unwrap();
-    */
-
-    let stmt = client
-        .prepare_typed(
-            "INSERT INTO public.zephyr_programs (code, is_contract, contracts) VALUES ($1, $2, $3)",
-            &[
-                tokio_postgres::types::Type::BYTEA,
-                tokio_postgres::types::Type::BOOL,
-                tokio_postgres::types::Type::TEXT_ARRAY,
-            ],
-        )
-        .await
-        .unwrap();
-
-    client
-        .execute(
-            &stmt,
-            &[
-                &code.as_slice(),
-                &is_contract,
-                &contracts,
-            ],
-        )
-        .await
-        .unwrap();
-
-    Ok(())
+async fn get_config() -> Config {
+    let project_definition = tokio::fs::read_to_string("./config/mercury.toml").await.unwrap();
+    toml::from_str(&project_definition).unwrap()
 }
 
-async fn upload(
-    code: &Vec<u8>,
-    is_contract: bool,
-    contracts: Vec<String>,
-) -> Result<(), crate::Error> {
-
-    let mut config = wasmi::Config::default();
-    let stack_limits = StackLimits::new(
-        MIN_VALUE_STACK_HEIGHT,
-        MAX_VALUE_STACK_HEIGHT,
-        MAX_RECURSION_DEPTH,
-    )
-    .map_err(|_| Error::InvalidWASMCode)?;
-
-    // TODO: decide which post-mvp features to override.
-    // For now we use wasmtime's defaults.
-    config.consume_fuel(true);
-    config.set_stack_limits(stack_limits);
-    config.compilation_mode(wasmi::CompilationMode::Lazy);
-
-    let engine = Engine::new(&config);
-    Module::validate(&engine, &code).map_err(|_| Error::InvalidWASMCode)?;
-
-    insert_zephyr_code(
-        code,
-        is_contract,
-        contracts,
-    )
-    .await?;
-
-    Ok(())
-}
 
 #[tokio::main]
 async fn main() {
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<UserLogPair>();
-    let arc_tx = Arc::new(tx.clone());
+    let (tx, rx) = mpsc::channel(20);
+    let database_sender = Arc::new(tx);
+    let config = get_config().await;
+    let conn_string = config.database_conn.clone();
+    let config_arc = Arc::new(config);
+    
+    tokio::spawn(async move {
+        let mut actor = PgConnectionActor::new(rx, &conn_string).await.expect("cannot connect to database");
+        actor.handle_instructions().await;
+    });
 
-    let pg_cfg: PgConfig = "./config/database.toml".parse().unwrap();
-    let pg_pool: Pool = pg_cfg.create_pool(NoTls).unwrap();
-
-    // check the upload function: start from there
-    // understand rhe best way to start the warp server 
     let upload_zephyr_code = warp::post()
-        .and(warp::path("zephyr_upload"))
-        .and(with_tx(arc_tx.clone()))
-        .and(with_db(pg_pool.clone()))
+        .and(warp::path("upload"))
+        .and(with_ctx(database_sender.clone()))
         .and(warp::body::json())
         .and_then(
-            |logger: Arc<UnboundedSender<UserLogPair>>,
-             mut sub: CodeUploadClient| async move {
-                let upload = upload(
-                    &sub.code.unwrap(),
-                    sub.contract.unwrap_or(false),
-                    sub.contracts.unwrap_or(vec![]),
-                )
-                .await;
+            |
+                database_sender: Arc<mpsc::Sender<DbInstructionWithCallback>>,
+                sub: CodeUploadClient
+            | async move {
+                let (tx, rx) = oneshot::channel();
+                let _ = database_sender.send(DbInstructionWithCallback::new(DbInstruction::UploadBinary(sub), tx)).await;
+                
+                let status = rx.await.map_err(|_| "internal error while awaiting receiver");
+                
+                Ok::<WithStatus<String>, Rejection>(warp::reply::with_status(
+                    serde_json::to_string(&status).unwrap(),
+                    StatusCode::CREATED,
+                ))
+            },
+        );
+    
+    let execute_zephyr_serverless = warp::path!("serverless" / String)
+        .and(warp::post())
+        .and(with_ctx(database_sender))
+        .and(with_ctx(config_arc))
+        .and(warp::body::json())
+        .and_then(
+            |hex, database_sender: Arc<mpsc::Sender<DbInstructionWithCallback>>, config: Arc<Config>, invocation: InvokeZephyrFunction| async move {
+                let binary_id = hex::decode(&hex).unwrap();
+                let (tx, rx) = oneshot::channel();
+                let _ = database_sender.send(DbInstructionWithCallback::new(DbInstruction::RequestBinary(binary_id), tx)).await;
+                
+                if let Ok(status) = rx.await {
+                    match status {
+                        ActorStatus::GotBinary(binary) => {
+                            // now can execute
+                            let input = config.function_from_invocation(invocation, binary);
+                            let result = serverless::execute_function(input, &config.executor_binary_path).await.map_err(|_| "failed to execute function");
 
-                    if let Err(_) = upload {
-                        return Ok::<WithStatus<String>, Rejection>(warp::reply::with_status(
-                            "Cannot force replace: use force_replace flag".to_string(),
-                            StatusCode::BAD_REQUEST,
-                        ));
+                            Ok::<WithStatus<String>, Rejection>(warp::reply::with_status(
+                                serde_json::to_string(&result).unwrap(),
+                                StatusCode::CREATED,
+                            ))
+                        }
+                        _ => {
+                            Ok::<WithStatus<String>, Rejection>(warp::reply::with_status(
+                                serde_json::to_string(&status).unwrap(),
+                                StatusCode::CREATED,
+                            ))
+                        }
                     }
-
-                    logger.send(UserLogPair {
-                        log: MercuryLog {
-                            level: LogLevel::Debug,
-                            message: "Uploaded new Zephyr binary".into(),
-                            data: None,
-                        },
-                    });
-
+                } else {
                     Ok::<WithStatus<String>, Rejection>(warp::reply::with_status(
-                        "true".to_string(),
+                        "internal error while awaiting receiver".to_string(),
                         StatusCode::CREATED,
                     ))
+                }
             },
         );
 
 
-        /*
-    // 3) Define /execute route
-    let execute = warp::post()
-        .and(warp::path("execute"))
-        */
-        
-        let routes = warp::post()
-        .and(upload_zephyr_code)
-        .with(warp::log("zephyr_uploader"));
+    let routes = warp::post()
+    .and(upload_zephyr_code)
+    .or(execute_zephyr_serverless);
 
-
-        /*
-    let routes = upload.or(execute)
-        .with(warp::log("zephyr_uploader"));
-
-        */
     warp::serve(routes).run(([0, 0, 0, 0], 8080)).await;
 }

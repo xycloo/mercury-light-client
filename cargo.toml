@@ -1,6 +1,20 @@
 [workspace]
 resolver = "2"
 members = [
-  "inner-onclose-handler",
   "execution-handler",
+  "ws-meta-executor"
 ]
+
+[workspace.dependencies]
+warp            = "0.3"
+tokio           = { version = "1", features = ["full"] }
+serde           = { version = "1.0", features = ["derive"] }
+serde_json      = "1.0"
+deadpool-postgres = "0.9"
+tokio-postgres = "0.7.10"
+sha2            = "0.10"
+anyhow = "1.0.98"
+hex = "0.4.3"
+toml = "0.8.21"
+bincode = "1.0"
+base64 = "0.22.1"
