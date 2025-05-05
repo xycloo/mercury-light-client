@@ -1,14 +1,14 @@
 use std::sync::Arc;
 
 use database::{ActorStatus, DbInstruction, DbInstructionWithCallback, PgConnectionActor};
-use serverless::{Config, InvokeZephyrFunction};
+use zephyr::serverless::{Config, InvokeZephyrFunction};
 use tokio::sync::{mpsc, oneshot};
 use warp::{reject::Rejection, reply::WithStatus, Filter, http::StatusCode};
 use serde::{Deserialize, Serialize};
 
 mod macros;
 mod database;
-mod serverless;
+mod zephyr;
 
 #[derive(Deserialize, Serialize, Debug)]
 struct CodeUploadClient {
@@ -66,6 +66,45 @@ async fn main() {
     
     let execute_zephyr_serverless = warp::path!("serverless" / String)
         .and(warp::post())
+        .and(with_ctx(database_sender.clone()))
+        .and(with_ctx(config_arc.clone()))
+        .and(warp::body::json())
+        .and_then(
+            |hex, database_sender: Arc<mpsc::Sender<DbInstructionWithCallback>>, config: Arc<Config>, invocation: InvokeZephyrFunction| async move {
+                let binary_id = hex::decode(&hex).unwrap();
+                let (tx, rx) = oneshot::channel();
+                let _ = database_sender.send(DbInstructionWithCallback::new(DbInstruction::RequestBinary(binary_id), tx)).await;
+                
+                if let Ok(status) = rx.await {
+                    match status {
+                        ActorStatus::GotBinary(binary) => {
+                            // now can execute
+                            let input = config.function_from_invocation(invocation, binary);
+                            let result = zephyr::serverless::execute_function(input, &config.executor_binary_path).await.map_err(|_| "failed to execute function");
+
+                            Ok::<WithStatus<String>, Rejection>(warp::reply::with_status(
+                                serde_json::to_string(&result).unwrap(),
+                                StatusCode::CREATED,
+                            ))
+                        }
+                        _ => {
+                            Ok::<WithStatus<String>, Rejection>(warp::reply::with_status(
+                                serde_json::to_string(&status).unwrap(),
+                                StatusCode::CREATED,
+                            ))
+                        }
+                    }
+                } else {
+                    Ok::<WithStatus<String>, Rejection>(warp::reply::with_status(
+                        "internal error while awaiting receiver".to_string(),
+                        StatusCode::CREATED,
+                    ))
+                }
+            },
+        );
+
+    let zephyr_catchup = warp::path!("zephyr" / "catchup" / String)
+        .and(warp::post())
         .and(with_ctx(database_sender))
         .and(with_ctx(config_arc))
         .and(warp::body::json())
@@ -80,7 +119,7 @@ async fn main() {
                         ActorStatus::GotBinary(binary) => {
                             // now can execute
                             let input = config.function_from_invocation(invocation, binary);
-                            let result = serverless::execute_function(input, &config.executor_binary_path).await.map_err(|_| "failed to execute function");
+                            let result = zephyr::serverless::execute_function(input, &config.executor_binary_path).await.map_err(|_| "failed to execute function");
 
                             Ok::<WithStatus<String>, Rejection>(warp::reply::with_status(
                                 serde_json::to_string(&result).unwrap(),
