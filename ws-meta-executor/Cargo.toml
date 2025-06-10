@@ -28,6 +28,7 @@ multiuser-logging-service = { path = "../../multiuser-logging-service", default-
 ] }
 hex = "0.4.3"
 rusqlite = "0.31.0"
+base64 = "0.21"
 
 [dependencies.soroban-env-host]
 package = "soroban-env-host-zephyr"

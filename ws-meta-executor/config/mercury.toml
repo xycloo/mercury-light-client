@@ -1,4 +1,0 @@
-network = "Test SDF Network ; September 2015"
-min = 0
-frequency = 100
-ws_address = "ws://127.0.0.1:4000/ws"

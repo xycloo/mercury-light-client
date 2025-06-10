@@ -15,7 +15,8 @@ pub enum ActorStatus {
     Uploaded,
     NotWhitelisted,
     FailedToGetBinary,
-    GotBinary(Vec<u8>)
+    GotBinary(Vec<u8>),
+    Synced(usize),  // number of whitelist entries loaded
 }
 
 #[derive(Debug, Clone)]
@@ -42,7 +43,7 @@ pub enum DbInstruction {
     RequestBinary(Vec<u8>),
     
     /// Fetches all whitelisted from the database. TODO this can greatly improved for perf on sync.
-    SyncWhitelisted
+    SyncWhitelisted,
 }
 
 pub struct PgConnectionActor {
@@ -184,7 +185,27 @@ impl PgConnectionActor {
             if let Some(received) = self.receiver.recv().await {
                 match received.instruction {
                     DbInstruction::SyncWhitelisted => {
-                        // reads whitelisted from database and updates self.whitelisted
+                        // 1) Query the whitelist table
+                        let stmt = self.client
+                            .prepare("SELECT hash_id FROM public.whitelist")
+                            .await;
+                        if let Ok(stmt) = stmt {
+                            if let Ok(rows) = self.client.query(&stmt, &[]).await {
+                                // 2) Collect the hashes
+                                let hashes: Vec<Vec<u8>> = rows
+                                    .into_iter()
+                                    .map(|r| r.get::<usize, Vec<u8>>(0))
+                                    .collect();
+                                let count = hashes.len();
+                                // 3) Update in-memory cache
+                                self.whitelisted = hashes;
+                                // 4) Reply back with how many we synced
+                                let _ = received.callback_send.send(ActorStatus::Synced(count));
+                                continue;
+                            }
+                        }
+                        // on error, still reply with zero
+                        let _ = received.callback_send.send(ActorStatus::Synced(0));
                     },
 
                     DbInstruction::UploadBinary(binary) => {

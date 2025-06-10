@@ -25,7 +25,7 @@ fn with_ctx<T: Send+Sync+Clone>(
 }
 
 async fn get_config() -> Config {
-    let project_definition = tokio::fs::read_to_string("./config/mercury.toml").await.unwrap();
+    let project_definition = tokio::fs::read_to_string("././config/mercury.toml").await.unwrap();
     toml::from_str(&project_definition).unwrap()
 }
 
@@ -60,6 +60,25 @@ async fn main() {
                 Ok::<WithStatus<String>, Rejection>(warp::reply::with_status(
                     serde_json::to_string(&status).unwrap(),
                     StatusCode::CREATED,
+                ))
+            },
+        );
+
+    let sync_whitelist = warp::post()
+        .and(warp::path("sync_whitelist"))
+        .and(with_ctx(database_sender.clone()))
+        .and_then(
+            |database_sender: Arc<mpsc::Sender<DbInstructionWithCallback>>| async move {
+                let (tx, rx) = oneshot::channel();
+                // fire off the instruction
+                let _ = database_sender.send(DbInstructionWithCallback::new(DbInstruction::SyncWhitelisted, tx)).await;
+                // await the actor’s reply
+                // implement better error handling also here
+                let status = rx.await.map_err(|_| "sync whitelist error");
+
+                Ok::<WithStatus<String>, Rejection>(warp::reply::with_status(
+                    serde_json::to_string(&status).unwrap(),
+                    StatusCode::OK,
                 ))
             },
         );
@@ -145,6 +164,7 @@ async fn main() {
 
     let routes = warp::post()
     .and(upload_zephyr_code)
+    .or(sync_whitelist)
     .or(execute_zephyr_serverless);
 
     warp::serve(routes).run(([0, 0, 0, 0], 8080)).await;

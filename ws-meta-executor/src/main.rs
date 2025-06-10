@@ -2,6 +2,7 @@ mod database;
 use self::database::MercuryDatabase;
 use ::zephyr::{db::ledger::LedgerStateRead, host::Host, vm::Vm, ZephyrStandard};
 use anyhow::Result;
+use base64::prelude::*;
 use futures::StreamExt;
 use multiuser_logging_service::LoggingClient;
 use postgres::NoTls;
@@ -19,14 +20,13 @@ use soroban_env_host::xdr::{
     AccountEntryExt, AccountEntryExtensionV1, AccountEntryExtensionV1Ext, LedgerEntry, Limits,
     ReadXdr, ScAddress, ScVal, WriteXdr,
 };
-use std::{
-    collections::HashMap, env, rc::Rc, str::FromStr, time::Duration
-};
+use std::{collections::HashMap, env, rc::Rc, str::FromStr, time::Duration};
 use tokio::{
     fs,
     process::Command,
     runtime::Handle,
-    sync::mpsc::{UnboundedReceiver, UnboundedSender}, task::JoinHandle,
+    sync::mpsc::{UnboundedReceiver, UnboundedSender},
+    task::JoinHandle,
 };
 use tokio_postgres::Client;
 use tokio_tungstenite::connect_async;
@@ -39,6 +39,8 @@ pub struct Config {
     pub max: Option<u32>,
     pub frequency: u32,
     pub ws_address: String,
+    pub database_conn: String,
+    pub executor_binary_path: String,
 }
 
 #[derive(Deserialize, Serialize, Debug)]
@@ -75,6 +77,13 @@ pub struct WebhookJob {
     builder_cloned: Option<RequestBuilder>,
     response: Result<Response, reqwest::Error>,
     request: AgnosticRequest,
+}
+
+pub async fn get_config() -> Config {
+    let project_definition = tokio::fs::read_to_string("././config/mercury.toml")
+        .await
+        .unwrap();
+    toml::from_str(&project_definition).unwrap()
 }
 
 impl WebhookJob {
@@ -382,7 +391,7 @@ async fn read_binaries(client: &Client) -> Result<Vec<ConstructedZephyrBinary>> 
 }
 
 async fn get_network_id_from_env() -> [u8; 32] {
-    let project_definition = fs::read_to_string("./config/mercury.toml").await.unwrap();
+    let project_definition = fs::read_to_string("././config/mercury.toml").await.unwrap();
     let config: Config = toml::from_str(&project_definition).unwrap();
 
     let mut hasher = Sha256::new();
@@ -390,8 +399,9 @@ async fn get_network_id_from_env() -> [u8; 32] {
     hasher.finalize().as_slice().try_into().unwrap()
 }
 
+// receives the metas through the ws server either from mercury's server or your local machine, then sends the message over the unbounded channel
 async fn fill_metas(tx: UnboundedSender<SyncRequest>) {
-    let project_definition = fs::read_to_string("./config/mercury.toml").await.unwrap();
+    let project_definition = fs::read_to_string("././config/mercury.toml").await.unwrap();
     let config: Config = toml::from_str(&project_definition).unwrap();
     let url = Url::parse(&config.ws_address).unwrap();
     let (ws_stream, _) = connect_async(url)
@@ -437,15 +447,14 @@ async fn fill_metas(tx: UnboundedSender<SyncRequest>) {
 
 pub struct MercuryLight {
     db: PgConnection,
-    
+
     /// Array of cached whitelisted program hashes that are allowed to be executed
     whitelisted: Vec<Vec<u8>>,
 
     /// Maps each binary hash to the binary.
     binaries: HashMap<Vec<u8>, Vec<u8>>,
 
-    meta_receiver: UnboundedReceiver<SyncRequest>
-
+    meta_receiver: UnboundedReceiver<SyncRequest>,
 }
 pub struct PgConnection {
     client: Client,
@@ -474,13 +483,16 @@ impl PgConnection {
     }
 }
 
+// still need to add retroshades
+
 impl MercuryLight {
     async fn meta_executor(&mut self) {
-        let postgres_args: String = env::var("INGESTOR_DB").unwrap();
+        let config = get_config().await;
+        let conn_string = config.database_conn.clone();
 
-        let (client, connection) = tokio_postgres::connect(&postgres_args, NoTls)
-            .await
-            .unwrap();
+        // let postgres_args: String = env::var("INGESTOR_DB").unwrap();
+
+        let (client, connection) = tokio_postgres::connect(&conn_string, NoTls).await.unwrap();
 
         tokio::spawn(async move {
             if let Err(e) = connection.await {
@@ -526,29 +538,16 @@ impl MercuryLight {
     }
 }
 
-/*
-async fn execute_function(function: FInput) -> anyhow::Result<()> {
-    let serialized = bincode::serialize(&function).unwrap();
-    let encoded = BASE64_STANDARD.encode(&serialized);
-    let child = Command::new(std::env::var("BINARY_PATH").expect("missing BINARY_PATH from enviornment"))
-        .arg(encoded.clone())
-        .spawn().unwrap();
-
-    let output = child.wait_with_output().await?;
-    if output.status.success() {
-        println!("[+] successfully called zephyr function")
-    } else {
-        println!("Zephyr function error: {:?}", output)
-    }
-
-    Ok(())
-}
-*/
-
 async fn spawn_programs(constructed: Vec<ConstructedZephyrBinary>, meta: Vec<u8>) {
-    let mut handles = Vec::new();
-
     for binary in constructed {
+        let function = FInput {
+            associated_data: meta.clone(),
+            user_id: 0,
+            network_id: get_network_id_from_env().await,
+            fname: "on_close".into(),
+            binary: BinaryType::Code(binary.code.clone()),
+        };
+
         let meta = {
             // use stellar_xdr::next::{Limits as BridgeLimits, WriteXdr};
             soroban_env_host::xdr::LedgerCloseMeta::from_xdr(meta.clone(), Limits::none())
@@ -559,37 +558,47 @@ async fn spawn_programs(constructed: Vec<ConstructedZephyrBinary>, meta: Vec<u8>
             return;
         }
 
-        let meta = meta.unwrap();
-
         println!("\nspawning binary\n");
 
-        let network_id = get_network_id_from_env().await;
+        println!("\nexecuting individual vm\n");
+        let execution = execute_function(function).await;
 
-        let handle = tokio::spawn(async move {
-            println!("\nexecuting individual vm\n");
-            let handle = Handle::current();
-            let execution = execute_individual_vm(handle, meta, binary.clone(), network_id).await;
-
-            match execution {
-                Ok(_) => {
-                    log::info!(target: "info", "Successfully executed Zephyr program for user {}", binary.user_id)
-                }
-                Err(e) => log::error!(
-                    "Error while executing Zephyr for user {}: {:?}",
-                    binary.user_id,
-                    e
-                ),
+        match execution {
+            Ok(_) => {
+                log::info!(target: "info", "Successfully executed Zephyr program for user {}", binary.user_id)
             }
-        });
-
-        handles.push(handle);
-    }
-
-    for job in handles {
-        let _ = job.await;
+            Err(e) => log::error!(
+                "Error while executing Zephyr for user {}: {:?}",
+                binary.user_id,
+                e
+            ),
+        }
     }
 }
 
+async fn execute_function(function: FInput) -> anyhow::Result<()> {
+    let config = get_config().await;
+    let binary_path = config.executor_binary_path.clone();
+
+    let serialized = bincode::serialize(&function).unwrap();
+    let encoded = BASE64_STANDARD.encode(&serialized);
+    let child =
+        Command::new(std::env::var(binary_path).expect("missing BINARY_PATH from enviornment"))
+            .arg(encoded.clone())
+            .spawn()
+            .unwrap();
+
+    let output = child.wait_with_output().await?;
+    if output.status.success() {
+        println!("[+] successfully called zephyr function")
+    } else {
+        println!("Zephyr function error: {:?}", output)
+    }
+
+    Ok(())
+}
+
+/*
 pub(crate) async fn execute_individual_vm(
     handle: Handle,
     meta: soroban_env_host::xdr::LedgerCloseMeta,
@@ -715,12 +724,22 @@ fn run_vm(
 
     Ok(())
 }
+    */
 
 #[tokio::main]
 async fn main() {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<SyncRequest>();
+
+    let config = get_config().await;
+    let mut light = MercuryLight {
+        db: PgConnection::new(&config.database_conn).await.unwrap(),
+        whitelisted: vec![],
+        binaries: HashMap::new(),
+        meta_receiver: rx,
+    };
+
     let fill_metas = tokio::spawn(async move { fill_metas(tx).await });
-    let spawn_executor = tokio::spawn(async move { meta_executor(&mut rx).await });
+    let spawn_executor = tokio::spawn(async move { light.meta_executor().await });
 
     let _ = tokio::join!(fill_metas, spawn_executor);
 }

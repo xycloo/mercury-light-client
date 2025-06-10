@@ -13,6 +13,19 @@ use zephyr::{
     ZephyrMock, ZephyrStandard,
 };
 
+use std::fs;
+
+#[derive(Deserialize, Serialize, Clone)]
+pub struct Config {
+    pub network: String,
+    pub min: Option<u32>,
+    pub max: Option<u32>,
+    pub frequency: u32,
+    pub ws_address: String,
+    pub database_conn: String
+
+}
+
 mod symbol {
     const TAG: u8 = 14;
 
@@ -485,9 +498,11 @@ fn get_table_types(client: &mut Client, table_name: &str) -> HashMap<String, Str
 }
 
 impl ZephyrStandard for MercuryDatabase {
-    fn zephyr_standard() -> Result<Self> {
+    fn zephyr_standard() -> anyhow::Result<Self> {
+        let toml_str = fs::read_to_string("././config/mercury.toml")?;
+        let cfg: Config = toml::from_str(&toml_str)?;
         Ok(MercuryDatabase {
-            postgres_arg: env::var("INGESTOR_DB").unwrap(),
+            postgres_arg: cfg.database_conn,
         })
     }
 }
