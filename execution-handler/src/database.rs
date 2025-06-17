@@ -22,7 +22,7 @@ pub enum ActorStatus {
 #[derive(Debug, Clone)]
 pub struct ConstructedZephyrBinary {
     pub code: Vec<u8>,    
-    pub is_contract: bool,
+    pub is_retroshade: bool,
     pub contracts: Option<Vec<String>>,
 }
 
@@ -79,7 +79,7 @@ impl PgConnectionActor {
         &self,
         hash: &Vec<u8>,
         code: &Vec<u8>,
-        is_contract: bool,
+        is_retroshade: bool,
         contracts: Vec<String>,
     ) -> anyhow::Result<()> {
         // nb: validates the binary before allowing the upload.
@@ -104,7 +104,7 @@ impl PgConnectionActor {
     
         let stmt = self.client
             .prepare_typed(
-                "INSERT INTO public.zephyr_programs (code, is_contract, contracts, hash) VALUES ($1, $2, $3, $4)",
+                "INSERT INTO public.zephyr_programs (code, is_retroshade, contracts, hash) VALUES ($1, $2, $3, $4)",
                 &[
                     tokio_postgres::types::Type::BYTEA,
                     tokio_postgres::types::Type::BOOL,
@@ -120,7 +120,7 @@ impl PgConnectionActor {
                 &stmt,
                 &[
                     &code.as_slice(),
-                    &is_contract,
+                    &is_retroshade,
                     &contracts,
                     hash
                 ],
@@ -148,37 +148,6 @@ impl PgConnectionActor {
 
         Ok(code)
     }
-
-    /*async fn read_binaries(&self) -> anyhow::Result<Vec<ConstructedZephyrBinary>> {
-        let code = self.client
-            .prepare_typed(
-                "select code, is_contract, contracts from public.zephyr_programs",
-                &[],
-            )
-            .await?;
-    
-        let rows = self.client.query(&code, &[]).await?;
-        let mut binaries = Vec::new();
-    
-        for row in rows {
-            let code: Vec<u8> = row.get(0);
-            let is_contract: bool = row.try_get(1).unwrap_or(false);
-    
-            let contracts = if is_contract {
-                Some(row.try_get(2).unwrap_or(vec![]))
-            } else {
-                None
-            };
-    
-            binaries.push(ConstructedZephyrBinary {
-                code,
-                is_contract,
-                contracts,
-            })
-        }
-    
-        Ok(binaries)
-    }*/
 
     pub async fn handle_instructions(&mut self) {
         loop {

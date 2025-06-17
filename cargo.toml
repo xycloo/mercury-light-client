@@ -18,3 +18,5 @@ hex = "0.4.3"
 toml = "0.8.21"
 bincode = "1.0"
 base64 = "0.22.1"
+reqwest = { version = "0.12.2", features = ["json"] }
+async-trait = "0.1.88"

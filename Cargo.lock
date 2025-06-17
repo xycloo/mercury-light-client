@@ -704,10 +704,12 @@ name = "execution-handler"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "base64 0.22.1",
  "bincode",
  "deadpool-postgres",
  "hex",
+ "reqwest 0.12.15",
  "serde",
  "serde_json",
  "sha2",

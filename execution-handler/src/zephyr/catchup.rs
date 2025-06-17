@@ -1,64 +1,31 @@
-use std::collections::HashMap;
-
-use serde::{Deserialize, Serialize};
+use std::marker::PhantomData;
+use events::{EventInspector, EventSource};
 use tokio::sync::mpsc;
+use types::{CatchupFunction, CatchupRequest, StatusMessage, ZephyrCatchupManager};
 
-use crate::zephyr::serverless::execute_function;
+mod manager;
+mod types;
+mod events;
 
-use super::serverless::FInput;
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct ScopedEventCatchup {
-    contracts: Vec<String>,
-    topic1s: Vec<String>,
-    topic2s: Vec<String>,
-    topic3s: Vec<String>,
-    topic4s: Vec<String>,
-    start: i64,
+pub struct GlobalCatchups<EI: EventInspector, ES: EventSource<EI>> {
+    pub catchup_receiver: mpsc::Receiver<CatchupRequest>,
+    pub event_source: Option<ES>,
+    pub zephyr_manager: ZephyrCatchupManager,
+    pub function_tx: mpsc::Sender<CatchupFunction>,
+    _inspector: PhantomData<EI>
 }
 
-pub enum StatusMessage {}
-
-pub struct ZephyrCatchupManager {
-    function_receiver: mpsc::Receiver<((Vec<u8>, FInput), (u32, u32))>,
-    status_receiver: mpsc::Receiver<StatusMessage>,
-    // hashid, (current_step, total)
-    jobs: HashMap<Vec<u8>, (u32, u32)>,
-    binary_path: String,
-}
-
-impl ZephyrCatchupManager {
-    pub fn new(binary_path: String, function_receiver: mpsc::Receiver<((Vec<u8>, FInput), (u32, u32))>, status_receiver: mpsc::Receiver<StatusMessage>) -> Self {
-        Self { function_receiver, status_receiver, jobs: HashMap::new(), binary_path }
+impl<EI: EventInspector, ES: EventSource<EI>> GlobalCatchups<EI, ES> {
+    pub fn new(binary_path: String, event_source: Option<ES>, catchup_receiver: mpsc::Receiver<CatchupRequest>, status_tx: mpsc::Receiver<StatusMessage>) -> Self {
+        let (ftx, frx) = mpsc::channel(20);
+        
+        let zephyr_manager = ZephyrCatchupManager::new(binary_path, frx, status_tx);
+        Self { event_source, zephyr_manager, _inspector: PhantomData {}, function_tx: ftx, catchup_receiver}
     }
 
     pub async fn consume(&mut self) {
-        loop {
-            tokio::select! {
-                // prioritizing settlement requests vs overlay messages, doesn't change too much on the CE since settlement
-                // still relies on overlay at some level but speeds up the process of getting the tx for the settler to
-                // send to the base chain.
-                biased;
-
-                message = self.status_receiver.recv() => {
-                    if let Some(message) = message {
-                        // todo
-                    }
-                }
-
-                request = self.function_receiver.recv() => {
-                    self.execute_catchup(request).await;
-                }
-            };
-        }
-    }
-
-    async fn execute_catchup(&mut self, request: Option<((Vec<u8>, FInput), (u32, u32))>) {
-        if let Some(((hash, function), (current, last))) = request {
-            let _ = execute_function(function, &self.binary_path).await;
-            let job = self.jobs.entry(hash).or_insert(Default::default());
-            job.0 = current;
-            job.1 = last;
+        while let Some(new_catchup) = self.catchup_receiver.recv().await {
+            
         }
     }
 }

@@ -69,7 +69,7 @@ pub struct ConstructedZephyrBinary {
     pub user_id: i32,
     pub code: Vec<u8>,
     pub running: bool,
-    pub is_contract: bool,
+    pub is_retroshade: bool,
     pub contracts: Option<Vec<String>>,
 }
 
@@ -355,7 +355,7 @@ impl LedgerStateRead for LedgerReader {
 async fn read_binaries(client: &Client) -> Result<Vec<ConstructedZephyrBinary>> {
     let code = client
         .prepare_typed(
-            "select user_id, code, running, is_contract, contracts from public.zephyr_programs",
+            "select user_id, code, running, is_retroshade, contracts from public.zephyr_programs",
             &[],
         )
         .await?;
@@ -370,9 +370,9 @@ async fn read_binaries(client: &Client) -> Result<Vec<ConstructedZephyrBinary>> 
             Ok(status) => status,
             Err(_) => true,
         };
-        let is_contract: bool = row.try_get(3).unwrap_or(false);
+        let is_retroshade: bool = row.try_get(3).unwrap_or(false);
 
-        let contracts = if is_contract {
+        let contracts = if is_retroshade {
             Some(row.try_get(4).unwrap_or(vec![]))
         } else {
             None
@@ -382,7 +382,7 @@ async fn read_binaries(client: &Client) -> Result<Vec<ConstructedZephyrBinary>> 
             user_id,
             code,
             running,
-            is_contract,
+            is_retroshade,
             contracts,
         })
     }
@@ -506,7 +506,7 @@ impl MercuryLight {
                 let mut mercury_contracts = Vec::new();
 
                 for program in constructed_binaries {
-                    if program.is_contract {
+                    if program.is_retroshade {
                         mercury_contracts.push(program.clone())
                     } else {
                         zephyr_programs.push(program.clone())
