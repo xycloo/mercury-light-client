@@ -1,18 +1,17 @@
 mod database;
-use self::database::MercuryDatabase;
-use ::zephyr::{db::ledger::LedgerStateRead, host::Host, vm::Vm, ZephyrStandard};
+use ::zephyr::{db::ledger::LedgerStateRead, ZephyrStandard};
 use anyhow::Result;
 use base64::prelude::*;
 use futures::StreamExt;
-use multiuser_logging_service::LoggingClient;
 use postgres::NoTls;
 use reqwest::{
     header::{HeaderMap, HeaderName},
     RequestBuilder, Response,
 };
+use retroshade::retroshades_main;
 use rs_zephyr_common::{
     http::{AgnosticRequest, Method},
-    Account, ContractDataEntry, RelayedMessageRequest,
+    Account, ContractDataEntry,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -20,17 +19,18 @@ use soroban_env_host::xdr::{
     AccountEntryExt, AccountEntryExtensionV1, AccountEntryExtensionV1Ext, LedgerEntry, Limits,
     ReadXdr, ScAddress, ScVal, WriteXdr,
 };
-use std::{collections::HashMap, env, rc::Rc, str::FromStr, time::Duration};
+use std::{collections::HashMap, str::FromStr, time::Duration};
 use tokio::{
     fs,
     process::Command,
-    runtime::Handle,
     sync::mpsc::{UnboundedReceiver, UnboundedSender},
     task::JoinHandle,
 };
 use tokio_postgres::Client;
 use tokio_tungstenite::connect_async;
 use url::Url;
+
+mod retroshade;
 
 #[derive(Deserialize, Serialize, Clone)]
 pub struct Config {
@@ -526,14 +526,55 @@ impl MercuryLight {
                 log::warn!("No zephyr binaries found");
                 (vec![], vec![])
             }
-
-            // client should be dropped here
         };
 
         // NB: subprocess exec makes it simpler to control the constraints.
         while let Some(data) = self.meta_receiver.recv().await {
             log::info!(target: "info", "Preparing {} programs to run on ledger {}", constructed.len(), data.sequence); // consoder removing this log later if the .clone() impacts performance
+
+            retroshades_main(&client, &mercury_contracts, &data.meta).await;
             spawn_programs(constructed.clone(), data.meta).await;
+        }
+    }
+}
+
+async fn execute_retroshades_contracts(
+    retroshades_contracts: Vec<ConstructedZephyrBinary>,
+    meta: Vec<u8>,
+) {
+    for binary in retroshades_contracts {
+        let function = FInput {
+            associated_data: meta.clone(),
+            user_id: 0,
+            network_id: get_network_id_from_env().await,
+            fname: "on_close".into(),
+            binary: BinaryType::Code(binary.code.clone()),
+        };
+
+        let meta = {
+            // use stellar_xdr::next::{Limits as BridgeLimits, WriteXdr};
+            soroban_env_host::xdr::LedgerCloseMeta::from_xdr(meta.clone(), Limits::none())
+        };
+
+        if meta.is_err() {
+            log::error!("Error while unsafely converting ledger close metas on jobs spawn");
+            return;
+        }
+
+        println!("\nspawning binary\n");
+
+        println!("\nexecuting individual vm\n");
+        let execution = execute_function(function).await;
+
+        match execution {
+            Ok(_) => {
+                log::info!(target: "info", "Successfully executed Zephyr program for user {}", binary.user_id)
+            }
+            Err(e) => log::error!(
+                "Error while executing Zephyr for user {}: {:?}",
+                binary.user_id,
+                e
+            ),
         }
     }
 }

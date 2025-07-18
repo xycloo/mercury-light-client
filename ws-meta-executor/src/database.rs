@@ -22,8 +22,7 @@ pub struct Config {
     pub max: Option<u32>,
     pub frequency: u32,
     pub ws_address: String,
-    pub database_conn: String
-
+    pub database_conn: String,
 }
 
 mod symbol {
@@ -479,14 +478,14 @@ fn get_table_types(client: &mut Client, table_name: &str) -> HashMap<String, Str
     let statement = if let Ok(statement) = statement {
         statement
     } else {
-        return HashMap::new()
+        return HashMap::new();
     };
-    
+
     let rows = client.query(&statement, &[&table_name]);
     let rows = if let Ok(rows) = rows {
         rows
     } else {
-        return HashMap::new()
+        return HashMap::new();
     };
 
     for row in rows {

@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
-use tokio::{sync::{mpsc, oneshot}, task::JoinHandle};
+use tokio::{
+    sync::{mpsc, oneshot},
+    task::JoinHandle,
+};
 use tokio_postgres::{Client, NoTls};
 use wasmi::StackLimits;
 
@@ -16,24 +19,27 @@ pub enum ActorStatus {
     NotWhitelisted,
     FailedToGetBinary,
     GotBinary(Vec<u8>),
-    Synced(usize),  // number of whitelist entries loaded
+    Synced(usize), // number of whitelist entries loaded
 }
 
 #[derive(Debug, Clone)]
 pub struct ConstructedZephyrBinary {
-    pub code: Vec<u8>,    
+    pub code: Vec<u8>,
     pub is_retroshade: bool,
     pub contracts: Option<Vec<String>>,
 }
 
 pub struct DbInstructionWithCallback {
     instruction: DbInstruction,
-    callback_send: oneshot::Sender<ActorStatus>
+    callback_send: oneshot::Sender<ActorStatus>,
 }
 
 impl DbInstructionWithCallback {
     pub fn new(instruction: DbInstruction, oneshot: oneshot::Sender<ActorStatus>) -> Self {
-        Self { instruction, callback_send: oneshot }
+        Self {
+            instruction,
+            callback_send: oneshot,
+        }
     }
 }
 
@@ -41,7 +47,7 @@ pub enum DbInstruction {
     UploadBinary(CodeUploadClient),
 
     RequestBinary(Vec<u8>),
-    
+
     /// Fetches all whitelisted from the database. TODO this can greatly improved for perf on sync.
     SyncWhitelisted,
 }
@@ -54,7 +60,10 @@ pub struct PgConnectionActor {
 }
 
 impl PgConnectionActor {
-    pub async fn new(rx: mpsc::Receiver<DbInstructionWithCallback>,conn: &str) -> Result<Self, tokio_postgres::Error> {
+    pub async fn new(
+        rx: mpsc::Receiver<DbInstructionWithCallback>,
+        conn: &str,
+    ) -> Result<Self, tokio_postgres::Error> {
         let (client, connection) = tokio_postgres::connect(conn, NoTls).await?;
 
         let connection_task = tokio::spawn(async move {
@@ -67,7 +76,7 @@ impl PgConnectionActor {
             receiver: rx,
             client,
             _connection_task: connection_task,
-            whitelisted: Default::default()
+            whitelisted: Default::default(),
         })
     }
 
@@ -84,24 +93,25 @@ impl PgConnectionActor {
     ) -> anyhow::Result<()> {
         // nb: validates the binary before allowing the upload.
         {
-            let mut config = wasmi::Config::default();    
+            let mut config = wasmi::Config::default();
             config.compilation_mode(wasmi::CompilationMode::Lazy);
 
             let stack_limits = StackLimits::new(
                 MIN_VALUE_STACK_HEIGHT,
                 MAX_VALUE_STACK_HEIGHT,
                 MAX_RECURSION_DEPTH,
-            ).map_err(|_| anyhow::anyhow!("invalid stack limits"))?; // todo here
-    
+            )
+            .map_err(|_| anyhow::anyhow!("invalid stack limits"))?; // todo here
+
             // TODO: decide which post-mvp features to override.
             // For now we use wasmtime's defaults.
             config.consume_fuel(true);
             config.set_stack_limits(stack_limits);
-    
+
             let engine = wasmi::Engine::new(&config);
             wasmi::Module::validate(&engine, &code)?;
         }
-    
+
         let stmt = self.client
             .prepare_typed(
                 "INSERT INTO public.zephyr_programs (code, is_retroshade, contracts, hash) VALUES ($1, $2, $3, $4)",
@@ -116,23 +126,15 @@ impl PgConnectionActor {
             ?;
 
         self.client
-            .execute(
-                &stmt,
-                &[
-                    &code.as_slice(),
-                    &is_retroshade,
-                    &contracts,
-                    hash
-                ],
-            )
-            .await
-            ?;
-    
+            .execute(&stmt, &[&code.as_slice(), &is_retroshade, &contracts, hash])
+            .await?;
+
         Ok(())
     }
 
     pub async fn read_binary(&self, hash: &Vec<u8>) -> anyhow::Result<Vec<u8>> {
-        let code = self.client
+        let code = self
+            .client
             .prepare_typed(
                 "select code from public.zephyr_programs WHERE hash = $1",
                 &[tokio_postgres::types::Type::BYTEA],
@@ -155,7 +157,8 @@ impl PgConnectionActor {
                 match received.instruction {
                     DbInstruction::SyncWhitelisted => {
                         // 1) Query the whitelist table
-                        let stmt = self.client
+                        let stmt = self
+                            .client
                             .prepare("SELECT hash_id FROM public.whitelist")
                             .await;
                         if let Ok(stmt) = stmt {
@@ -175,17 +178,24 @@ impl PgConnectionActor {
                         }
                         // on error, still reply with zero
                         let _ = received.callback_send.send(ActorStatus::Synced(0));
-                    },
+                    }
 
                     DbInstruction::UploadBinary(binary) => {
                         let hash = sha2::Sha256::digest(&binary.code).to_vec();
                         if self.whitelisted.contains(&hash) {
-                            let _ = self.upload(&hash, &binary.code, binary.contract.unwrap_or(false), binary.contracts.unwrap_or_default()).await;
+                            let _ = self
+                                .upload(
+                                    &hash,
+                                    &binary.code,
+                                    binary.contract.unwrap_or(false),
+                                    binary.contracts.unwrap_or_default(),
+                                )
+                                .await;
                             received.callback_send.send(ActorStatus::Uploaded);
                         } else {
                             received.callback_send.send(ActorStatus::NotWhitelisted);
                         }
-                    },
+                    }
 
                     DbInstruction::RequestBinary(hash) => {
                         if self.whitelisted.contains(&hash) {

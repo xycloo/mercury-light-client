@@ -1,4 +1,8 @@
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
+
+use crate::zephyr::catchup::events::EventInspector;
 
 pub fn get_query_generic(
     contracts: &[String],
@@ -110,7 +114,6 @@ query Test {{
     Request { query }
 }
 
-
 #[derive(Serialize, Deserialize)]
 pub struct Request {
     pub query: String,
@@ -122,11 +125,30 @@ pub struct Ledger {
     pub sequence: i64,
 }
 
+impl Into<crate::zephyr::catchup::events::Ledger> for Ledger {
+    fn into(self) -> crate::zephyr::catchup::events::Ledger {
+        crate::zephyr::catchup::events::Ledger {
+            close_time: self.closeTime,
+            sequence: self.sequence,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct TxInfo {
     pub txHash: String,
     pub ledgerByLedger: Ledger,
     pub resultXdr: Option<String>,
+}
+
+impl Into<crate::zephyr::catchup::events::TxInfo> for TxInfo {
+    fn into(self) -> crate::zephyr::catchup::events::TxInfo {
+        crate::zephyr::catchup::events::TxInfo {
+            tx_hash: self.txHash,
+            ledger_info: self.ledgerByLedger.into(),
+            result_xdr: self.resultXdr,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -153,6 +175,54 @@ pub struct Data {
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct Response {
     pub data: Data,
+}
+
+impl EventInspector for Response {
+    fn all_by_ledger(
+        &self,
+    ) -> BTreeMap<i64, (i64, Vec<crate::zephyr::catchup::events::EventNode>)> {
+        let mut all_events_by_ledger: BTreeMap<
+            i64,
+            (i64, Vec<crate::zephyr::catchup::events::EventNode>),
+        > = BTreeMap::new();
+
+        for event in self.data.eventByContractIds.nodes.clone() {
+            let seq = event.txInfoByTx.ledgerByLedger.sequence;
+            let time = event.txInfoByTx.ledgerByLedger.closeTime;
+
+            if all_events_by_ledger.contains_key(&seq) {
+                let mut other_events: Vec<crate::zephyr::catchup::events::EventNode> =
+                    all_events_by_ledger
+                        .get(&seq)
+                        .unwrap()
+                        .1
+                        .to_vec()
+                        .iter()
+                        .map(|e| e.clone().into())
+                        .collect();
+                other_events.push(event.into());
+                all_events_by_ledger.insert(seq, (time, other_events));
+            } else {
+                all_events_by_ledger.insert(seq, (time, vec![event.into()]));
+            }
+        }
+
+        all_events_by_ledger
+    }
+}
+
+impl Into<crate::zephyr::catchup::events::EventNode> for EventNode {
+    fn into(self) -> crate::zephyr::catchup::events::EventNode {
+        crate::zephyr::catchup::events::EventNode {
+            tx_info: self.txInfoByTx.into(),
+            contract_id: self.contractId,
+            topic1: self.topic1,
+            topic2: self.topic2,
+            topic3: self.topic3,
+            topic4: self.topic4,
+            data: self.data,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]

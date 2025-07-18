@@ -1,7 +1,7 @@
-use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
-mod mercury;
+pub mod mercury;
 
 #[async_trait::async_trait]
 pub trait EventSource<EI: EventInspector> {

@@ -29,6 +29,10 @@ multiuser-logging-service = { path = "../../multiuser-logging-service", default-
 hex = "0.4.3"
 rusqlite = "0.31.0"
 base64 = "0.21"
+retroshade = { path = "../../retroshade/retroshade" }
+stellar-strkey = "0.0.7"
+tracing = {workspace=true}
+md5 = {workspace=true}
 
 [dependencies.soroban-env-host]
 package = "soroban-env-host-zephyr"

@@ -20,3 +20,12 @@ bincode = "1.0"
 base64 = "0.22.1"
 reqwest = { version = "0.12.2", features = ["json"] }
 async-trait = "0.1.88"
+tracing = "0.1.41"
+stellar-strkey = "0.0.7"
+md5 = "0.7.0"
+
+[workspace.dependencies.soroban-env-host]
+package = "soroban-env-host-zephyr"
+#version = "21.2.0"
+path = "../rs-soroban-env/soroban-env-host"
+features = ["testutils", "next"]
