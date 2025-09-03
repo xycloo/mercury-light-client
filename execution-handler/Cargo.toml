@@ -20,5 +20,10 @@ base64 = {workspace=true}
 reqwest = {workspace=true}
 async-trait = {workspace=true}
 tracing = {workspace=true}
+tracing-subscriber = {workspace=true}
 soroban-env-host = {workspace=true}
 stellar-strkey = {workspace=true}
+
+[features]
+default = []
+allowall = []

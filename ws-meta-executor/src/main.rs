@@ -1,5 +1,4 @@
 mod database;
-use ::zephyr::{db::ledger::LedgerStateRead, ZephyrStandard};
 use anyhow::Result;
 use base64::prelude::*;
 use futures::StreamExt;
@@ -8,17 +7,17 @@ use reqwest::{
     header::{HeaderMap, HeaderName},
     RequestBuilder, Response,
 };
-use retroshade::retroshades_main;
+use retroshade::soroban_env_host::xdr::{
+    AccountEntryExt, AccountEntryExtensionV1, AccountEntryExtensionV1Ext, LedgerEntry, Limits,
+    ReadXdr, ScAddress, ScVal, WriteXdr,
+};
+use retroshade_handler::retroshades_main;
 use rs_zephyr_common::{
     http::{AgnosticRequest, Method},
     Account, ContractDataEntry,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use soroban_env_host::xdr::{
-    AccountEntryExt, AccountEntryExtensionV1, AccountEntryExtensionV1Ext, LedgerEntry, Limits,
-    ReadXdr, ScAddress, ScVal, WriteXdr,
-};
 use std::{collections::HashMap, str::FromStr, time::Duration};
 use tokio::{
     fs,
@@ -29,8 +28,9 @@ use tokio::{
 use tokio_postgres::Client;
 use tokio_tungstenite::connect_async;
 use url::Url;
+use zephyr::{db::ledger::LedgerStateRead, ZephyrStandard};
 
-mod retroshade;
+mod retroshade_handler;
 
 #[derive(Deserialize, Serialize, Clone)]
 pub struct Config {
@@ -46,7 +46,6 @@ pub struct Config {
 #[derive(Deserialize, Serialize, Debug)]
 pub struct SyncRequest {
     meta: Vec<u8>,
-    sequence: i64,
 }
 
 #[derive(Deserialize, Serialize, Debug)]
@@ -180,7 +179,7 @@ impl WebhookJob {
         Err(self.inspect().unwrap_or("Reqwest error".into()))
     }
 }
-
+/*
 #[derive(Clone)]
 pub struct LedgerReader {
     path: String,
@@ -207,7 +206,7 @@ impl LedgerStateRead for LedgerReader {
         let conn = if let Ok(conn) = conn {
             conn
         } else {
-            println!("failed to open connection to databased from ledgerread");
+            tracing::info!("failed to open connection to databased from ledgerread");
             return None;
         };
 
@@ -350,12 +349,12 @@ impl LedgerStateRead for LedgerReader {
 
         last
     }
-}
+}*/
 
 async fn read_binaries(client: &Client) -> Result<Vec<ConstructedZephyrBinary>> {
     let code = client
         .prepare_typed(
-            "select user_id, code, running, is_retroshade, contracts from public.zephyr_programs",
+            "select code, is_retroshade, contracts from public.zephyr_programs",
             &[],
         )
         .await?;
@@ -364,24 +363,19 @@ async fn read_binaries(client: &Client) -> Result<Vec<ConstructedZephyrBinary>> 
     let mut binaries = Vec::new();
 
     for row in rows {
-        let user_id: i32 = row.get(0);
-        let code: Vec<u8> = row.get(1);
-        let running: bool = match row.try_get(2) {
-            Ok(status) => status,
-            Err(_) => true,
-        };
-        let is_retroshade: bool = row.try_get(3).unwrap_or(false);
+        let code: Vec<u8> = row.get(0);
+        let is_retroshade: bool = row.try_get(1).unwrap_or(false);
 
         let contracts = if is_retroshade {
-            Some(row.try_get(4).unwrap_or(vec![]))
+            Some(row.try_get(2).unwrap_or(vec![]))
         } else {
             None
         };
 
         binaries.push(ConstructedZephyrBinary {
-            user_id,
+            user_id: 0,
             code,
-            running,
+            running: true,
             is_retroshade,
             contracts,
         })
@@ -407,7 +401,7 @@ async fn fill_metas(tx: UnboundedSender<SyncRequest>) {
     let (ws_stream, _) = connect_async(url)
         .await
         .expect("Failed to connect to the server");
-    println!("Connected to the server.");
+    tracing::info!("Connected to the server.");
     let (_, mut read) = ws_stream.split();
 
     while let Some(message) = read.next().await {
@@ -417,28 +411,27 @@ async fn fill_metas(tx: UnboundedSender<SyncRequest>) {
 
                 match serde_json::from_str::<SyncRequest>(text) {
                     Ok(sync_req) => {
-                        println!(
-                            "Received SyncRequest with meta length: {} bytes and sequence {}",
+                        tracing::info!(
+                            "Received SyncRequest with meta length: {} bytes",
                             sync_req.meta.len(),
-                            sync_req.sequence
                         );
 
                         let _ = tx.send(sync_req);
                     }
                     Err(e) => {
-                        eprintln!("Failed to parse SyncRequest: {:?}", e);
+                        tracing::info!("Failed to parse SyncRequest: {:?}", e);
                     }
                 }
             }
             Ok(msg) if msg.is_close() => {
-                println!("Server closed the connection.");
+                tracing::info!("Server closed the connection.");
                 break;
             }
             Ok(_) => {
                 //
             }
             Err(e) => {
-                eprintln!("Error receiving message: {:?}", e);
+                tracing::info!("Error receiving message: {:?}", e);
                 break;
             }
         }
@@ -468,7 +461,7 @@ impl PgConnection {
 
         let connection_task = tokio::spawn(async move {
             if let Err(e) = connection.await {
-                eprintln!("Postgres connection error: {}", e);
+                tracing::info!("Postgres connection error: {}", e);
             }
         });
 
@@ -483,25 +476,13 @@ impl PgConnection {
     }
 }
 
-// still need to add retroshades
-
 impl MercuryLight {
     async fn meta_executor(&mut self) {
-        let config = get_config().await;
-        let conn_string = config.database_conn.clone();
+        let client = &self.db.client;
 
-        // let postgres_args: String = env::var("INGESTOR_DB").unwrap();
-
-        let (client, connection) = tokio_postgres::connect(&conn_string, NoTls).await.unwrap();
-
-        tokio::spawn(async move {
-            if let Err(e) = connection.await {
-                eprintln!("connection error: {}", e);
-            }
-        });
-
-        let (constructed, mercury_contracts) = {
-            if let Ok(constructed_binaries) = read_binaries(&client).await {
+        let (_constructed, mercury_contracts) = {
+            let binaries = read_binaries(&client).await;
+            if let Ok(constructed_binaries) = binaries {
                 let mut zephyr_programs = Vec::new();
                 let mut mercury_contracts = Vec::new();
 
@@ -513,7 +494,6 @@ impl MercuryLight {
                     }
                 }
 
-                // log::info!(target: "info", "Preparing {} programs to run on ledger {}", zephyr_programs.len(), self.sequence());
                 let mut running_programs = Vec::new();
                 for program in zephyr_programs {
                     if program.running {
@@ -523,63 +503,22 @@ impl MercuryLight {
 
                 (running_programs, mercury_contracts)
             } else {
-                log::warn!("No zephyr binaries found");
+                tracing::warn!("No zephyr binaries found: {:?}", binaries);
                 (vec![], vec![])
             }
         };
 
         // NB: subprocess exec makes it simpler to control the constraints.
         while let Some(data) = self.meta_receiver.recv().await {
-            log::info!(target: "info", "Preparing {} programs to run on ledger {}", constructed.len(), data.sequence); // consoder removing this log later if the .clone() impacts performance
+            log::info!(target: "info", "Preparing {} retroshades programs to run on ledger", mercury_contracts.len());
 
             retroshades_main(&client, &mercury_contracts, &data.meta).await;
-            spawn_programs(constructed.clone(), data.meta).await;
+            //spawn_programs(constructed.clone(), data.meta).await;
         }
     }
 }
 
-async fn execute_retroshades_contracts(
-    retroshades_contracts: Vec<ConstructedZephyrBinary>,
-    meta: Vec<u8>,
-) {
-    for binary in retroshades_contracts {
-        let function = FInput {
-            associated_data: meta.clone(),
-            user_id: 0,
-            network_id: get_network_id_from_env().await,
-            fname: "on_close".into(),
-            binary: BinaryType::Code(binary.code.clone()),
-        };
-
-        let meta = {
-            // use stellar_xdr::next::{Limits as BridgeLimits, WriteXdr};
-            soroban_env_host::xdr::LedgerCloseMeta::from_xdr(meta.clone(), Limits::none())
-        };
-
-        if meta.is_err() {
-            log::error!("Error while unsafely converting ledger close metas on jobs spawn");
-            return;
-        }
-
-        println!("\nspawning binary\n");
-
-        println!("\nexecuting individual vm\n");
-        let execution = execute_function(function).await;
-
-        match execution {
-            Ok(_) => {
-                log::info!(target: "info", "Successfully executed Zephyr program for user {}", binary.user_id)
-            }
-            Err(e) => log::error!(
-                "Error while executing Zephyr for user {}: {:?}",
-                binary.user_id,
-                e
-            ),
-        }
-    }
-}
-
-async fn spawn_programs(constructed: Vec<ConstructedZephyrBinary>, meta: Vec<u8>) {
+/*async fn spawn_programs(constructed: Vec<ConstructedZephyrBinary>, meta: Vec<u8>) {
     for binary in constructed {
         let function = FInput {
             associated_data: meta.clone(),
@@ -590,7 +529,6 @@ async fn spawn_programs(constructed: Vec<ConstructedZephyrBinary>, meta: Vec<u8>
         };
 
         let meta = {
-            // use stellar_xdr::next::{Limits as BridgeLimits, WriteXdr};
             soroban_env_host::xdr::LedgerCloseMeta::from_xdr(meta.clone(), Limits::none())
         };
 
@@ -599,9 +537,9 @@ async fn spawn_programs(constructed: Vec<ConstructedZephyrBinary>, meta: Vec<u8>
             return;
         }
 
-        println!("\nspawning binary\n");
+        tracing::info!("\nspawning binary\n");
 
-        println!("\nexecuting individual vm\n");
+        tracing::info!("\nexecuting individual vm\n");
         let execution = execute_function(function).await;
 
         match execution {
@@ -616,6 +554,7 @@ async fn spawn_programs(constructed: Vec<ConstructedZephyrBinary>, meta: Vec<u8>
         }
     }
 }
+*/
 
 async fn execute_function(function: FInput) -> anyhow::Result<()> {
     let config = get_config().await;
@@ -631,145 +570,19 @@ async fn execute_function(function: FInput) -> anyhow::Result<()> {
 
     let output = child.wait_with_output().await?;
     if output.status.success() {
-        println!("[+] successfully called zephyr function")
+        tracing::info!("successfully called zephyr function")
     } else {
-        println!("Zephyr function error: {:?}", output)
+        tracing::info!("Zephyr function error: {:?}", output)
     }
 
     Ok(())
 }
 
-/*
-pub(crate) async fn execute_individual_vm(
-    handle: Handle,
-    meta: soroban_env_host::xdr::LedgerCloseMeta,
-    binary: ConstructedZephyrBinary,
-    network_id: [u8; 32],
-) -> Result<()> {
-    let user_id = binary.user_id;
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-
-    let join_handle = handle.spawn_blocking(move || run_vm(meta, &binary.clone(), tx, network_id));
-
-    // note: we probably need a much better story for managing this.
-    let _timeout = tokio::time::timeout(Duration::from_secs(5), join_handle).await???;
-    //join_handle.await??;
-
-    let _ = handle
-        .spawn(async move {
-            let mut handles = Vec::new();
-            while let Some(message) = rx.recv().await {
-                let request = bincode::deserialize::<RelayedMessageRequest>(&message);
-                match request {
-                    Ok(RelayedMessageRequest::Http(request)) => {
-                        let handle = tokio::spawn(async move {
-                            let builder = WebhookJob::build_request(request.clone());
-                            let builder_cloned = builder.try_clone();
-
-                            let response = builder.send().await;
-                            let mut job = WebhookJob {
-                                builder_cloned,
-                                response,
-                                request,
-                            };
-
-                            if !job.is_success() {
-                                let logging_client = LoggingClient::new();
-                                let _ = logging_client
-                                    .send_log(
-                                        user_id as i64,
-                                        multiuser_logging_service::LogLevel::Error,
-                                        job.inspect().unwrap_or("Reqwest error".into()),
-                                    )
-                                    .await;
-
-                                let result = job.handle_retry(3).await;
-
-                                if result.is_ok() {
-                                    let _ = logging_client
-                                        .send_log(
-                                            user_id as i64,
-                                            multiuser_logging_service::LogLevel::Warning,
-                                            format!(
-                                                "Request succeeded after {} attempts",
-                                                result.unwrap()
-                                            ),
-                                        )
-                                        .await;
-                                } else {
-                                    let _ = logging_client
-                                        .send_log(
-                                            user_id as i64,
-                                            multiuser_logging_service::LogLevel::Error,
-                                            format!(
-                                                "Exceeded max retries, request still failing: {}",
-                                                result.err().unwrap()
-                                            ),
-                                        )
-                                        .await;
-                                }
-                            };
-                        });
-
-                        handles.push(handle)
-                    }
-
-                    Ok(RelayedMessageRequest::Log(log)) => {
-                        let mut map = HashMap::new();
-                        map.insert("serialized", bincode::serialize(&log).unwrap());
-
-                        let client = reqwest::Client::new();
-                        let _ = client
-                            .post(format!("http://127.0.0.1:8082/log/{}", user_id))
-                            .json(&map)
-                            .send()
-                            .await;
-                    }
-
-                    _ => {}
-                }
-            }
-
-            for handle in handles {
-                let result = handle.await;
-            }
-        })
-        .await;
-
-    Ok(())
-}
-
-fn run_vm(
-    meta: soroban_env_host::xdr::LedgerCloseMeta,
-    binary: &ConstructedZephyrBinary,
-    tx: UnboundedSender<Vec<u8>>,
-    network_id: [u8; 32],
-) -> Result<()> {
-    let mut host: Host<MercuryDatabase, LedgerReader> =
-        Host::from_id(binary.user_id as i64, network_id)?;
-
-    host.add_transmitter(tx);
-    host.add_ledger_close_meta(meta.to_xdr(soroban_env_host::xdr::Limits::none()).unwrap())?;
-
-    let start = std::time::Instant::now();
-    let vm = Vm::new(&host, &binary.code)?;
-
-    log::info!(target: "zephyr", "Time elapsed after instantiation: {:?}", start.elapsed());
-
-    host.load_context(Rc::downgrade(&vm)).unwrap();
-    let call = vm.metered_function_call(&host, "on_close");
-
-    log::info!(target: "zephyr", "Time elapsed after execution for user {}: {:?}", binary.user_id, start.elapsed());
-
-    call.unwrap_or("Unreachable operation executed".into());
-
-    Ok(())
-}
-    */
-
 #[tokio::main]
 async fn main() {
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<SyncRequest>();
+    tracing_subscriber::fmt::init();
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<SyncRequest>();
 
     let config = get_config().await;
     let mut light = MercuryLight {

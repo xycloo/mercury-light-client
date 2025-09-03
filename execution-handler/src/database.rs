@@ -84,6 +84,28 @@ impl PgConnectionActor {
         &self.client
     }
 
+    async fn ensure_zephyr_programs_table(&self) -> anyhow::Result<()> {
+        self.client()
+            .execute("CREATE SCHEMA IF NOT EXISTS retroshade;", &[])
+            .await?;
+
+        self.client()
+            .execute(
+                "
+                CREATE TABLE IF NOT EXISTS public.zephyr_programs (
+                    code BYTEA NOT NULL,
+                    is_retroshade BOOL NOT NULL,
+                    contracts TEXT[],
+                    hash BYTEA NOT NULL
+                );
+                ",
+                &[],
+            )
+            .await?;
+
+        Ok(())
+    }
+
     async fn upload(
         &self,
         hash: &Vec<u8>,
@@ -112,6 +134,12 @@ impl PgConnectionActor {
             wasmi::Module::validate(&engine, &code)?;
         }
 
+        if let Err(e) = self.ensure_zephyr_programs_table().await {
+            tracing::error!("failed to create zephyr programs table {:?}", e)
+        };
+
+        tracing::info!("preparing statement to run");
+
         let stmt = self.client
             .prepare_typed(
                 "INSERT INTO public.zephyr_programs (code, is_retroshade, contracts, hash) VALUES ($1, $2, $3, $4)",
@@ -123,11 +151,24 @@ impl PgConnectionActor {
                 ],
             )
             .await
-            ?;
+            ;
 
-        self.client
+        if let Err(e) = stmt {
+            tracing::info!("failed to build statement: {:?}", e);
+            return Ok(());
+        }
+        let stmt = stmt.unwrap();
+
+        tracing::info!("executing statement");
+
+        let result = self
+            .client
             .execute(&stmt, &[&code.as_slice(), &is_retroshade, &contracts, hash])
-            .await?;
+            .await;
+
+        if let Err(e) = result {
+            tracing::info!("failed to execute statement: {:?}", e);
+        }
 
         Ok(())
     }
@@ -182,7 +223,9 @@ impl PgConnectionActor {
 
                     DbInstruction::UploadBinary(binary) => {
                         let hash = sha2::Sha256::digest(&binary.code).to_vec();
-                        if self.whitelisted.contains(&hash) {
+
+                        #[cfg(feature = "allowall")]
+                        {
                             let _ = self
                                 .upload(
                                     &hash,
@@ -192,8 +235,23 @@ impl PgConnectionActor {
                                 )
                                 .await;
                             received.callback_send.send(ActorStatus::Uploaded);
-                        } else {
-                            received.callback_send.send(ActorStatus::NotWhitelisted);
+                        }
+
+                        #[cfg(not(feature = "allowall"))]
+                        {
+                            if self.whitelisted.contains(&hash) {
+                                let _ = self
+                                    .upload(
+                                        &hash,
+                                        &binary.code,
+                                        binary.contract.unwrap_or(false),
+                                        binary.contracts.unwrap_or_default(),
+                                    )
+                                    .await;
+                                received.callback_send.send(ActorStatus::Uploaded);
+                            } else {
+                                received.callback_send.send(ActorStatus::NotWhitelisted);
+                            }
                         }
                     }
 

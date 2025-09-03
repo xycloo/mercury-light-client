@@ -4,6 +4,7 @@ use retroshade::soroban_env_host::xdr::Limits as RetroshadeLimits;
 use retroshade::soroban_env_host::LedgerInfo;
 use retroshade::{RetroshadeExportPretty, RetroshadesExecution};
 use sha2::Digest;
+//use soroban_env_host::xdr::ReadXdr;
 use std::collections::HashMap;
 use std::rc::Rc;
 use stellar_xdr::next::{
@@ -20,13 +21,18 @@ use crate::{get_network_id_from_env, ConstructedZephyrBinary};
 mod retro_snapshot {
     use retroshade::soroban_env_host::xdr::Limits as RetroshadeLimits;
     use retroshade::soroban_env_host::xdr::ReadXdr;
-    use retroshade::soroban_env_host::xdr::WriteXdr;
+    use retroshade::soroban_env_host::xdr::{
+        ContractCodeEntry, ContractDataEntry, ContractExecutable, ExtensionPoint, Hash,
+        LedgerEntry, LedgerEntryData, LedgerEntryExt, LedgerKey, ScAddress, ScContractInstance,
+        ScMap, ScVal, WriteXdr,
+    };
     use zephyr::snapshot::raw_endpoint::entry_and_ttl;
 
     use std::rc::Rc;
 
     pub struct RetroshadeSnapshot {}
 
+    #[cfg(not(feature = "mock"))]
     impl retroshade::soroban_env_host::storage::SnapshotSource for RetroshadeSnapshot {
         fn get(
             &self,
@@ -48,6 +54,42 @@ mod retro_snapshot {
             } else {
                 Ok(None)
             }
+        }
+    }
+
+    #[cfg(feature = "mock")]
+    impl retroshade::soroban_env_host::storage::SnapshotSource for RetroshadeSnapshot {
+        fn get(
+            &self,
+            key: &std::rc::Rc<retroshade::soroban_env_host::xdr::LedgerKey>,
+        ) -> Result<
+            Option<retroshade::soroban_env_host::storage::EntryWithLiveUntil>,
+            retroshade::soroban_env_host::HostError,
+        > {
+            let entry = match key.as_ref() {
+                LedgerKey::ContractCode(_) => LedgerEntry {
+                    last_modified_ledger_seq: 0,
+                    ext: LedgerEntryExt::V0,
+                    data: LedgerEntryData::ContractCode(ContractCodeEntry {
+                        ext: retroshade::soroban_env_host::xdr::ContractCodeEntryExt::V0,
+                        hash: Hash([0;32]),
+                        code: std::fs::read("/Users/tdep/projects/retroshade/examples/hello_world/target/wasm32-unknown-unknown/release/soroban_hello_world_contract.wasm").unwrap().try_into().unwrap()
+                    })
+                },
+                LedgerKey::ContractData(_) => LedgerEntry { last_modified_ledger_seq: 0, data: LedgerEntryData::ContractData(ContractDataEntry {
+                    ext: ExtensionPoint::V0,
+                    contract: ScAddress::Contract(Hash([0;32]).into()),
+                    durability: retroshade::soroban_env_host::xdr::ContractDataDurability::Persistent,
+                    key: retroshade::soroban_env_host::xdr::ScVal::LedgerKeyContractInstance,
+                    val: ScVal::ContractInstance(ScContractInstance {
+                        executable: ContractExecutable::Wasm(Hash([0; 32])),
+                        storage: Some(ScMap(vec![].try_into().unwrap()))
+                    })
+                }), ext: LedgerEntryExt::V0 },
+                _ => panic!()
+            };
+
+            Ok(Some((Rc::new(entry), Some(10000))))
         }
     }
 }
@@ -164,7 +206,7 @@ async fn execute_retroshades<'a>(
 
         let ledger_info = {
             let mut ledger_info = LedgerInfo::default();
-            ledger_info.protocol_version = 22;
+            ledger_info.protocol_version = 23;
             let ledger_from_state = snapshot::snapshot_utils::get_current_ledger_sequence();
             ledger_info.sequence_number = ledger_from_state.0 as u32;
             ledger_info.timestamp = ledger_from_state.1 as u64;
@@ -173,7 +215,7 @@ async fn execute_retroshades<'a>(
             ledger_info
         };
 
-        let meta = { soroban_env_host::xdr::LedgerCloseMeta::from_xdr(meta, Limits::none())? };
+        let meta = { stellar_xdr::next::LedgerCloseMeta::from_xdr(meta, Limits::none())? };
 
         match meta {
             stellar_xdr::next::LedgerCloseMeta::V1(v1) => {
@@ -186,14 +228,17 @@ async fn execute_retroshades<'a>(
                     txphase_to_sequential_txenvelopes(&phase, &mut envelopes);
                 }
 
+                tracing::info!("processing transaction envelopes");
                 for transaction_envelope in envelopes {
                     match transaction_envelope {
                         TransactionEnvelope::Tx(v1) => {
                             let tx_hash = get_tx_hash(&v1.tx).await;
+                            tracing::info!("processing envelope {:?}", tx_hash);
                             let mut associated_meta = None;
 
                             for txmeta in &processing {
                                 if let TransactionMeta::V3(v3) = &txmeta.tx_apply_processing {
+                                    tracing::info!("{:?}", &txmeta.result.transaction_hash.0);
                                     if tx_hash == txmeta.result.transaction_hash.0 {
                                         associated_meta = Some(v3);
                                     }
@@ -204,6 +249,7 @@ async fn execute_retroshades<'a>(
                                 let mut retroshades_execution =
                                     RetroshadesExecution::new(ledger_info.clone());
 
+                                info!("building from envelopoe and meta");
                                 let has_retroshades = retroshades_execution
                                     .build_from_envelope_and_meta(
                                         Box::new(retro_snapshot::RetroshadeSnapshot {}),
@@ -215,12 +261,13 @@ async fn execute_retroshades<'a>(
 
                                 // is in fact a soroban tx
                                 if let Ok(true) = has_retroshades {
+                                    tracing::info!("tx {:?} has retroshades", v1);
                                     let retroshades = retroshades_execution
                                         .retroshade_packed_recording(Rc::new(
                                             retro_snapshot::RetroshadeSnapshot {},
                                         ))
                                         .map_err(|e| anyhow::anyhow!("retroshades error {:?}", e));
-
+                                    tracing::info!("executed recording");
                                     if let Ok(retroshades) = retroshades {
                                         println!(
                                             "Adding retroshades effect for contracts {:?}",
@@ -236,6 +283,8 @@ async fn execute_retroshades<'a>(
                                         println!("Error in retroshades {:?}", retroshades);
                                     }
                                 }
+                            } else {
+                                tracing::warn!("no associated meta found");
                             }
                         }
 
@@ -258,6 +307,7 @@ async fn execute_retroshades<'a>(
                                 let mut retroshades_execution =
                                     RetroshadesExecution::new(ledger_info.clone());
 
+                                info!("building from envelopoe and meta");
                                 let has_retroshades = retroshades_execution
                                     .build_from_envelope_and_meta(
                                         Box::new(retro_snapshot::RetroshadeSnapshot {}),
@@ -268,11 +318,151 @@ async fn execute_retroshades<'a>(
                                     .map_err(|e| anyhow::anyhow!("retroshades error {:?}", e));
 
                                 if let Ok(true) = has_retroshades {
+                                    info!("has retroshades");
                                     let retroshades = retroshades_execution
                                         .retroshade_packed_recording(Rc::new(
                                             retro_snapshot::RetroshadeSnapshot {},
                                         ))
                                         .map_err(|e| anyhow::anyhow!("retroshades error {:?}", e));
+                                    info!("executed recording");
+
+                                    if let Ok(retroshades) = retroshades {
+                                        let retroshade_hash = md5::compute(codes[0]).0;
+                                        retroshade_effects_with_hash.push((
+                                            retroshade_hash,
+                                            retroshades,
+                                            tx_hash,
+                                        ))
+                                    } else {
+                                        println!("Error in retroshades {:?}", retroshades);
+                                    }
+                                }
+                            }
+                        }
+
+                        _ => (),
+                    }
+                }
+            }
+
+            stellar_xdr::next::LedgerCloseMeta::V2(v2) => {
+                let processing = v2.tx_processing.to_vec();
+
+                let GeneralizedTransactionSet::V1(txsetv1) = v2.tx_set;
+                let mut envelopes = Vec::new();
+
+                for phase in txsetv1.phases.to_vec() {
+                    txphase_to_sequential_txenvelopes(&phase, &mut envelopes);
+                }
+
+                tracing::info!("processing transaction envelopes");
+                for transaction_envelope in envelopes {
+                    match transaction_envelope {
+                        TransactionEnvelope::Tx(v1) => {
+                            let tx_hash = get_tx_hash(&v1.tx).await;
+                            tracing::info!("processing envelope {:?}", tx_hash);
+                            let mut associated_meta = None;
+
+                            for txmeta in &processing {
+                                if let TransactionMeta::V3(_v3) = &txmeta.tx_apply_processing {
+                                    if tx_hash == txmeta.result.transaction_hash.0 {
+                                        associated_meta = Some(txmeta.tx_apply_processing.clone());
+                                    }
+                                } else if let TransactionMeta::V4(_v4) = &txmeta.tx_apply_processing
+                                {
+                                    if tx_hash == txmeta.result.transaction_hash.0 {
+                                        associated_meta = Some(txmeta.tx_apply_processing.clone());
+                                    }
+                                }
+                            }
+
+                            if let Some(associated_meta) = associated_meta {
+                                info!("found soroban transaction");
+                                let mut retroshades_execution =
+                                    RetroshadesExecution::new(ledger_info.clone());
+
+                                info!("building from envelopoe and meta");
+                                let has_retroshades = retroshades_execution
+                                    .build_from_envelope_and_meta(
+                                        Box::new(retro_snapshot::RetroshadeSnapshot {}),
+                                        xdr_roundtrip(&v1),
+                                        xdr_roundtrip(&associated_meta),
+                                        mercury_contracts_hashmap.clone(),
+                                    )
+                                    .map_err(|e| anyhow::anyhow!("retroshades error {:?}", e));
+
+                                info!(
+                                    "{} has retroshades: {:?}",
+                                    hex::encode(tx_hash),
+                                    has_retroshades
+                                );
+
+                                // is in fact a soroban tx
+                                if let Ok(true) = has_retroshades {
+                                    tracing::info!("tx {:?} has retroshades", v1);
+                                    let retroshades = retroshades_execution
+                                        .retroshade_packed_recording(Rc::new(
+                                            retro_snapshot::RetroshadeSnapshot {},
+                                        ))
+                                        .map_err(|e| anyhow::anyhow!("retroshades error {:?}", e));
+                                    tracing::info!("executed recording");
+                                    if let Ok(retroshades) = retroshades {
+                                        println!(
+                                            "Adding retroshades effect for contracts {:?}",
+                                            contract.contracts
+                                        );
+                                        let retroshade_hash = md5::compute(codes[0]).0;
+                                        retroshade_effects_with_hash.push((
+                                            retroshade_hash,
+                                            retroshades,
+                                            tx_hash,
+                                        ))
+                                    } else {
+                                        println!("Error in retroshades {:?}", retroshades);
+                                    }
+                                }
+                            } else {
+                                tracing::warn!("no associated meta found");
+                            }
+                        }
+
+                        TransactionEnvelope::TxFeeBump(feebump) => {
+                            let inner_tx = feebump.tx;
+                            let tx_hash = get_feebumptx_hash(&inner_tx).await;
+                            let mut associated_meta = None;
+
+                            for txmeta in &processing {
+                                if let TransactionMeta::V3(v3) = &txmeta.tx_apply_processing {
+                                    if tx_hash == txmeta.result.transaction_hash.0 {
+                                        associated_meta = Some(v3);
+                                    }
+                                }
+                            }
+
+                            if let Some(associated_meta) = associated_meta {
+                                let FeeBumpTransactionInnerTx::Tx(v1) = inner_tx.inner_tx;
+
+                                let mut retroshades_execution =
+                                    RetroshadesExecution::new(ledger_info.clone());
+
+                                info!("building from envelopoe and meta");
+                                let has_retroshades = retroshades_execution
+                                    .build_from_envelope_and_meta(
+                                        Box::new(retro_snapshot::RetroshadeSnapshot {}),
+                                        xdr_roundtrip(&v1),
+                                        xdr_roundtrip(associated_meta),
+                                        mercury_contracts_hashmap.clone(),
+                                    )
+                                    .map_err(|e| anyhow::anyhow!("retroshades error {:?}", e));
+
+                                if let Ok(true) = has_retroshades {
+                                    info!("has retroshades");
+                                    let retroshades = retroshades_execution
+                                        .retroshade_packed_recording(Rc::new(
+                                            retro_snapshot::RetroshadeSnapshot {},
+                                        ))
+                                        .map_err(|e| anyhow::anyhow!("retroshades error {:?}", e));
+                                    info!("executed recording");
 
                                     if let Ok(retroshades) = retroshades {
                                         let retroshade_hash = md5::compute(codes[0]).0;

@@ -1,6 +1,8 @@
 network = "Test SDF Network ; September 2015"
 min = 0
 frequency = 100
-database_conn = "postgresql://federicodeponti@localhost:5432/mercury_light_db"
-executor_binary_path = "/Users/federicodeponti/Desktop/zephyr/target/release/zephyr_binary"
+database_conn = "postgresql://postgres@localhost:5432/mercury_light_db"
+executor_binary_path = "/Users/tommasodeponti/Desktop/zephyr/target/release/zephyr_binary"
 ws_address = "ws://127.0.0.1:4000/ws"
+graphql_endpoint = ""
+jwt = ""

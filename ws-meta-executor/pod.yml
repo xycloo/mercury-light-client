@@ -1,0 +1,52 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: retroshades-executor-pod
+spec:
+  hostNetwork: true
+  volumes:
+    - name: config-volume
+      configMap:
+        name: executor-config
+    - name: pgdata
+      hostPath:
+        path: /var/lib/retroshades/pgdata
+        type: DirectoryOrCreate
+  containers:
+    - name: postgres
+      image: docker.io/library/postgres:16-alpine
+      env:
+        - name: POSTGRES_DB
+          value: "mercury_light_db"
+        - name: POSTGRES_USER
+          value: "postgres"
+        - name: POSTGRES_HOST_AUTH_METHOD
+          value: "trust"
+      ports:
+        - containerPort: 5432
+      volumeMounts:
+        - name: pgdata
+          mountPath: /var/lib/postgresql/data
+
+    - name: retroshades-executor-container
+      image: docker.io/xycloo/retroshades-executor:latest
+      volumeMounts:
+        - name: config-volume
+          mountPath: /app/config/mercury.toml
+          subPath: mercury.toml
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: executor-config
+data:
+  mercury.toml: |
+    network = "Test SDF Network ; September 2015"
+    min = 0
+    frequency = 100
+    database_conn = "postgresql://postgres@localhost:5432/mercury_light_db"
+    ws_address = "ws://127.0.0.1:4000/ws"
+    executor_binary_path = ""
+    graphql_endpoint = ""
+    jwt = ""

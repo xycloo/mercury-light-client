@@ -35,6 +35,8 @@ async fn get_config() -> Config {
 
 #[tokio::main]
 async fn main() {
+    tracing_subscriber::fmt::init();
+
     let (tx, rx) = mpsc::channel(20);
     let (status_tx, status_rx) = mpsc::channel(20);
     let (catchup_tx, catchup_rx) = mpsc::channel(20);
