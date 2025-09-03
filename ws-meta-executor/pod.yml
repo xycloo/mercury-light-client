@@ -9,9 +9,7 @@ spec:
       configMap:
         name: executor-config
     - name: pgdata
-      hostPath:
-        path: /var/lib/retroshades/pgdata
-        type: DirectoryOrCreate
+      emptyDir: {}
   containers:
     - name: postgres
       image: docker.io/library/postgres:16-alpine
